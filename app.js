@@ -1,5 +1,6 @@
 /* =========================================================
    HEISSE ECKE – WEB APP (Single-File JS, GitHub Pages)
+   Full Params + CAPEX + Break-even
    FIX: Keine DOM-Queries auf IDs bevor Node im DOM ist.
 ========================================================= */
 
@@ -11,7 +12,7 @@ const LS = {
   workspace: "he_workspace",
   theme: "he_theme",
   session: "he_session",
-  state: "he_state_v1",
+  state: "he_state_v2",
   lastSaved: "he_last_saved",
   syncStatus: "he_sync_status",
   activeTab: "he_active_tab"
@@ -36,14 +37,17 @@ function todayISO(){ return new Date().toISOString().slice(0,10); }
 function safeJsonParse(v, fallback){ try{ return v ? JSON.parse(v) : fallback; }catch{ return fallback; } }
 function readLS(key, fallback){ return safeJsonParse(localStorage.getItem(key), fallback); }
 function writeLS(key, value){ localStorage.setItem(key, JSON.stringify(value)); }
-
 function escapeHtml(s){ return String(s ?? "").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
+
 function toNumber(x){
   if(x === null || x === undefined) return 0;
   const s = String(x).trim().replace(",", ".");
   const n = Number(s);
   return Number.isFinite(n) ? n : 0;
 }
+function pct(x){ return toNumber(x)/100; }
+function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
+
 function fmtEUR(n){ return `${(Number.isFinite(n)?n:0).toFixed(2)} €`; }
 function uuid(){
   if(crypto?.randomUUID) return crypto.randomUUID();
@@ -66,10 +70,50 @@ function defaultState(){
     users: [{ username: "admin", displayName: "Admin" }],
     inventory: [], // {id, group, name, supplier, unitType('g'|'ml'|'stk'), packSize, packPrice}
     recipes: [],   // {id, topCat, subCat, name, menuPrice, lines:[{id, inventoryId, qty}]}
-    params: { franchisePct: 0, vatPct: 7 },
+    params: {
+      // price model
+      priceIncludesVat: true,
+      vatPct: 7,
+
+      // variable fees on revenue
+      platformPct: 0,
+      paymentPct: 0,
+      deliveryPct: 0,
+      deliveryFixed: 0,
+      franchisePct: 0,
+      marketingPct: 0,
+
+      // variable costs per order / expected losses
+      packagingFixed: 0,
+      wastePct: 0,
+      refundPct: 0,
+
+      // fixed monthly costs (OPEX)
+      opex: {
+        rent: 0,
+        staff: 0,
+        utilities: 0,
+        internet: 0,
+        insurance: 0,
+        software: 0,
+        other: 0
+      },
+
+      // CAPEX / amortization
+      capexTotal: 0,
+      capexAmortMonths: 36,
+
+      // financing (optional)
+      financingEnabled: false,
+      equity: 0,
+      loanAmount: 0,
+      interestPctPA: 0,
+      loanMonths: 36
+    },
     sales: []      // {id, date, recipeId, qty}
   };
 }
+
 function getWorkspace(){ return (localStorage.getItem(LS.workspace)||"").trim(); }
 function setWorkspace(ws){ localStorage.setItem(LS.workspace, ws.trim()); }
 function getSession(){ return readLS(LS.session, null); }
@@ -78,7 +122,11 @@ function clearSession(){ localStorage.removeItem(LS.session); }
 
 function loadState(){
   const st = readLS(LS.state, null);
-  if(st && typeof st === "object") return st;
+  if(st && typeof st === "object"){
+    // migrate if missing new params keys
+    st.params = migrateParams(st.params);
+    return st;
+  }
   const d = defaultState();
   writeLS(LS.state, d);
   return d;
@@ -87,6 +135,22 @@ function saveState(st){
   writeLS(LS.state, st);
   localStorage.setItem(LS.lastSaved, nowISO());
   scheduleCloudSave();
+}
+
+function migrateParams(p){
+  const base = defaultState().params;
+  const src = (p && typeof p === "object") ? p : {};
+  const out = { ...base, ...src };
+  out.opex = { ...base.opex, ...(src.opex || {}) };
+  // if user toggled financing but loanAmount empty: compute from capex - equity
+  if(out.financingEnabled){
+    const cap = toNumber(out.capexTotal);
+    const eq = toNumber(out.equity);
+    if(toNumber(out.loanAmount) <= 0 && cap > 0){
+      out.loanAmount = Math.max(0, cap - eq);
+    }
+  }
+  return out;
 }
 
 /* ----------------------- Supabase Sync ----------------------- */
@@ -159,8 +223,10 @@ async function cloudPullOnStart(){
     setSyncStatus("Sync: lade …");
     const row = await supabaseFetch(ws);
     if(row?.data){
-      writeLS(LS.state, row.data);
-      localStorage.setItem(LS.lastSaved, row.data.savedAt || nowISO());
+      const merged = row.data;
+      merged.params = migrateParams(merged.params);
+      writeLS(LS.state, merged);
+      localStorage.setItem(LS.lastSaved, merged.savedAt || nowISO());
       setSyncStatus("Sync: geladen ✅");
     }else{
       await supabaseUpsert(ws, { ...loadState(), savedAt: localStorage.getItem(LS.lastSaved) || nowISO() });
@@ -185,7 +251,8 @@ function unitPrice(inv){
   if(packSize <= 0) return 0;
   return packPrice / packSize; // €/g or €/ml
 }
-function recipeCost(recipe, inventoryById){
+
+function recipeCostBase(recipe, inventoryById){
   const lines = recipe.lines || [];
   return lines.reduce((sum, l)=>{
     const inv = inventoryById[l.inventoryId];
@@ -193,16 +260,80 @@ function recipeCost(recipe, inventoryById){
     return sum + (toNumber(l.qty) * unitPrice(inv));
   }, 0);
 }
-function recipeDB(recipe, params, inventoryById, overridePriceNullable){
-  const price = (overridePriceNullable !== null && overridePriceNullable !== undefined)
+
+function annuityMonthlyPayment(principal, annualPct, months){
+  const P = toNumber(principal);
+  const n = Math.max(0, Math.floor(toNumber(months)));
+  if(P <= 0 || n <= 0) return 0;
+  const r = pct(annualPct) / 12; // monthly rate
+  if(r <= 0) return P / n;
+  const pow = Math.pow(1 + r, n);
+  return P * (r * pow) / (pow - 1);
+}
+
+function opexMonthly(params){
+  const o = params?.opex || {};
+  return toNumber(o.rent) + toNumber(o.staff) + toNumber(o.utilities) + toNumber(o.internet) +
+         toNumber(o.insurance) + toNumber(o.software) + toNumber(o.other);
+}
+
+function capexMonthly(params){
+  const cap = toNumber(params?.capexTotal);
+  const m = Math.max(1, Math.floor(toNumber(params?.capexAmortMonths) || 36));
+  const dep = cap > 0 ? (cap / m) : 0;
+
+  let loan = 0;
+  if(!!params?.financingEnabled){
+    const loanAmount = toNumber(params?.loanAmount) > 0 ? toNumber(params?.loanAmount) : Math.max(0, cap - toNumber(params?.equity));
+    loan = annuityMonthlyPayment(loanAmount, toNumber(params?.interestPctPA), Math.max(1, Math.floor(toNumber(params?.loanMonths) || m)));
+  }
+  return { depreciation: dep, loanPayment: loan, capexMonthlyTotal: dep + loan };
+}
+
+/**
+ * recipeContribution:
+ * - WE incl waste%
+ * - Revenue gross (menuPrice)
+ * - Revenue net if priceIncludesVat (gross/(1+vat))
+ * - Variable fees calculated on gross by default (platform/payment/delivery/franchise/marketing)
+ * - Packaging fixed per order
+ * - Refund% reduces effective revenue (expected)
+ */
+function recipeContribution(recipe, params, inventoryById, overridePriceNullable){
+  const p = migrateParams(params);
+  const gross = (overridePriceNullable !== null && overridePriceNullable !== undefined)
     ? toNumber(overridePriceNullable)
     : toNumber(recipe.menuPrice);
 
-  const cost = recipeCost(recipe, inventoryById);
-  const frPct = toNumber(params.franchisePct)/100;
-  const db = price - cost - (price * frPct);
-  const dbPct = price > 0 ? (db/price)*100 : 0;
-  return { price, cost, db, dbPct };
+  const vat = pct(p.vatPct);
+  const net = p.priceIncludesVat ? (vat > 0 ? gross / (1 + vat) : gross) : gross;
+
+  const costBase = recipeCostBase(recipe, inventoryById);
+  const wasteFactor = 1 + pct(p.wastePct);
+  const cost = costBase * wasteFactor;
+
+  const refundFactor = 1 - pct(p.refundPct);
+  const effectiveGross = gross * refundFactor;
+
+  const varFees =
+    effectiveGross * pct(p.platformPct) +
+    effectiveGross * pct(p.paymentPct) +
+    effectiveGross * pct(p.deliveryPct) +
+    toNumber(p.deliveryFixed) +
+    effectiveGross * pct(p.franchisePct) +
+    effectiveGross * pct(p.marketingPct) +
+    toNumber(p.packagingFixed);
+
+  const contribution = effectiveGross - cost - varFees;
+  const contributionPct = gross > 0 ? (contribution / gross) * 100 : 0;
+
+  return {
+    gross, net,
+    costBase, cost,
+    varFees,
+    contribution,
+    contributionPct
+  };
 }
 
 /* ----------------------- UI Base ----------------------- */
@@ -243,8 +374,8 @@ function injectBaseStyles(){
     .input, select, textarea{ width:100%; padding:10px 10px; border-radius:10px; border:1px solid var(--border); background:var(--input); color:var(--text); outline:none; box-sizing:border-box; }
     .label{ font-size:12px; color:var(--muted); margin-top:10px; margin-bottom:6px; }
     .grid{ display:grid; grid-template-columns: repeat(12, 1fr); gap:12px; }
-    .col-12{ grid-column: span 12; } .col-6{ grid-column: span 6; } .col-4{ grid-column: span 4; } .col-8{ grid-column: span 8; }
-    @media (max-width: 900px){ .col-6,.col-4,.col-8{ grid-column: span 12; } }
+    .col-12{ grid-column: span 12; } .col-6{ grid-column: span 6; } .col-4{ grid-column: span 4; } .col-8{ grid-column: span 8; } .col-3{ grid-column: span 3; }
+    @media (max-width: 900px){ .col-6,.col-4,.col-8,.col-3{ grid-column: span 12; } }
     .tabs{ display:flex; gap:8px; flex-wrap:wrap; }
     .tab{ background:var(--tab); border:1px solid var(--border); padding:9px 10px; border-radius:10px; cursor:pointer; font-weight:800; color:var(--text); }
     .tab.active{ outline:2px solid var(--primary); }
@@ -259,6 +390,7 @@ function injectBaseStyles(){
     .small{ font-size:12px; color:var(--muted); }
     .two{ display:flex; gap:10px; flex-wrap:wrap; }
     .two > div{ flex: 1; min-width: 220px; }
+    .hint{ font-size:12px; color:var(--muted); margin-top:6px; }
   `});
   document.head.appendChild(style);
 }
@@ -301,7 +433,6 @@ function screenLogin(){
 
   const btnLogin = el("button", { class:"btn primary" }, ["Weiter"]);
   const btnTheme = el("button", { class:"btn" }, ["Hell/Dunkel"]);
-
   btnTheme.onclick = toggleTheme;
 
   btnLogin.onclick = async ()=>{
@@ -309,7 +440,7 @@ function screenLogin(){
     const w = (wsInput.value || "").trim();
     const u = (userInput.value || "").trim();
 
-    if(!w){ msg.textContent = "Workspace ist Pflicht."; return; }
+    if(!w){ msg.textContent = "Workspace ist Pflicht (darf NICHT leer sein)."; return; }
     if(!u){ msg.textContent = "Username fehlt."; return; }
 
     setWorkspace(w);
@@ -335,13 +466,13 @@ function screenLogin(){
   ]);
 
   const info = el("div", { class:"card col-12 col-6" }, [
-    el("div", { class:"title" }, ["MVP Umfang"]),
+    el("div", { class:"title" }, ["Scope (liefert morgen)"]),
     el("div", { class:"sub", html: `
-      ✅ Inventur anlegen + editieren<br/>
-      ✅ Rezepte anlegen + Zutaten/Mengen editieren<br/>
-      ✅ Wareneinsatz + DB € / %<br/>
-      ✅ Daily Sales → Tages-DB<br/>
-      ✅ Franchise% Parameter<br/>
+      ✅ Inventur + €/Einheit<br/>
+      ✅ Rezepte (nur Inventur-Artikel auswählbar)<br/>
+      ✅ Variable Gebühren + Packaging + Waste/Refund<br/>
+      ✅ Fixkosten + CAPEX (Abschreibung) + optional Finanzierung<br/>
+      ✅ Daily Sales → Tages-DB + Break-even/Tag<br/>
       ✅ Sync über Geräte via Workspace<br/>
     `})
   ]);
@@ -428,6 +559,8 @@ function renderActiveTab(tab){
   if(!content) return;
   content.innerHTML = "";
   const st = loadState();
+  st.params = migrateParams(st.params);
+  saveState(st); // keep migration persisted
 
   if(tab === "dashboard") content.appendChild(renderDashboard(st));
   if(tab === "inventory") content.appendChild(renderInventory(st));
@@ -440,43 +573,62 @@ function renderActiveTab(tab){
 /* ----------------------- Dashboard ----------------------- */
 function renderDashboard(st){
   const invById = Object.fromEntries((st.inventory||[]).map(x=>[x.id,x]));
+  const p = migrateParams(st.params);
+
   const rows = (st.recipes||[]).map(r=>{
-    const calc = recipeDB(r, st.params||{}, invById, null);
+    const calc = recipeContribution(r, p, invById, null);
     return { id:r.id, name:r.name, cat:`${r.topCat||""} / ${r.subCat||""}`, ...calc };
   });
 
   const today = todayISO();
   const salesToday = (st.sales||[]).filter(s=>s.date === today);
-  const dbToday = salesToday.reduce((sum, s)=>{
+
+  let grossToday = 0;
+  let contribToday = 0;
+  salesToday.forEach(s=>{
     const r = (st.recipes||[]).find(x=>x.id === s.recipeId);
-    if(!r) return sum;
-    const calc = recipeDB(r, st.params||{}, invById, null);
-    return sum + calc.db * toNumber(s.qty);
-  }, 0);
+    if(!r) return;
+    const c = recipeContribution(r, p, invById, null);
+    const q = toNumber(s.qty);
+    grossToday += c.gross * q;
+    contribToday += c.contribution * q;
+  });
+
+  const opexM = opexMonthly(p);
+  const cap = capexMonthly(p);
+  const fixedMonthlyTotal = opexM + cap.capexMonthlyTotal;
+  const fixedDaily = fixedMonthlyTotal / 30;
+
+  const beRevenuePerDay = (contribToday > 0 && grossToday > 0)
+    ? (fixedDaily / (contribToday / grossToday))
+    : 0;
 
   const card1 = el("div", { class:"card col-12 col-6" }, [
-    el("div", { class:"title" }, ["Status"]),
+    el("div", { class:"title" }, ["Heute"]),
     el("div", { class:"hr" }),
     el("div", { class:"sub", html: `
-      Inventur-Artikel: <b>${(st.inventory||[]).length}</b><br/>
-      Rezepte: <b>${(st.recipes||[]).length}</b><br/>
       Sales heute (${today}): <b>${salesToday.length}</b><br/>
-      DB heute: <b class="${dbToday>=0?"ok":"bad"}">${fmtEUR(dbToday)}</b>
+      Umsatz (gross) heute: <b>${fmtEUR(grossToday)}</b><br/>
+      Beitrag (nach WE+Fees) heute: <b class="${contribToday>=0?"ok":"bad"}">${fmtEUR(contribToday)}</b><br/>
     `})
   ]);
 
   const card2 = el("div", { class:"card col-12 col-6" }, [
-    el("div", { class:"title" }, ["Hinweis"]),
+    el("div", { class:"title" }, ["Fixkosten & Break-even"]),
     el("div", { class:"hr" }),
     el("div", { class:"sub", html: `
-      Erst Inventur sauber, dann Rezepte.<br/>
-      Franchise% wird im DB berücksichtigt.<br/>
-      Sync Fehler: Supabase Tabelle/Policy checken.
+      OPEX/Monat: <b>${fmtEUR(opexM)}</b><br/>
+      CAPEX/Monat: <b>${fmtEUR(cap.capexMonthlyTotal)}</b>
+      <span class="small">(Abschr. ${fmtEUR(cap.depreciation)} + Kredit ${fmtEUR(cap.loanPayment)})</span><br/>
+      Fixkosten/Monat: <b>${fmtEUR(fixedMonthlyTotal)}</b><br/>
+      Fixkosten/Tag (÷30): <b>${fmtEUR(fixedDaily)}</b><br/>
+      Break-even Umsatz/Tag (nur wenn Sales vorhanden): <b>${beRevenuePerDay>0?fmtEUR(beRevenuePerDay):"—"}</b>
     `})
   ]);
 
   const table = el("div", { class:"card col-12" }, [
-    el("div", { class:"title" }, ["Gerichte – Wareneinsatz & DB"]),
+    el("div", { class:"title" }, ["Gerichte – WE, Fees, Beitrag"]),
+    el("div", { class:"sub" }, ["Beitrag = Umsatz (gross, erwartungswert nach Refund) − Wareneinsatz (inkl Waste) − variable Fees (Plattform/Payment/Delivery/Franchise/Marketing) − Packaging"]),
     el("div", { class:"hr" }),
     el("div", { style:"overflow:auto;border-radius:12px;border:1px solid var(--border)" }, [
       el("table", {}, [
@@ -484,30 +636,43 @@ function renderDashboard(st){
           el("tr", {}, [
             el("th", {}, ["Gericht"]),
             el("th", {}, ["Kategorie"]),
-            el("th", { class:"right" }, ["Wareneinsatz"]),
             el("th", { class:"right" }, ["Preis"]),
-            el("th", { class:"right" }, ["DB €"]),
-            el("th", { class:"right" }, ["DB %"])
+            el("th", { class:"right" }, ["WE"]),
+            el("th", { class:"right" }, ["Fees"]),
+            el("th", { class:"right" }, ["Beitrag €"]),
+            el("th", { class:"right" }, ["Beitrag %"])
           ])
         ]),
         el("tbody", {}, rows.map(r=>{
           return el("tr", {}, [
             el("td", { html: escapeHtml(r.name) }),
             el("td", { html: escapeHtml(r.cat) }),
+            el("td", { class:"right" }, [fmtEUR(r.gross)]),
             el("td", { class:"right" }, [fmtEUR(r.cost)]),
-            el("td", { class:"right" }, [fmtEUR(r.price)]),
-            el("td", { class:`right ${r.db>=0?"ok":"bad"}` }, [fmtEUR(r.db)]),
-            el("td", { class:`right ${r.dbPct>=0?"ok":"bad"}` }, [`${r.dbPct.toFixed(1)}%`])
+            el("td", { class:"right" }, [fmtEUR(r.varFees)]),
+            el("td", { class:`right ${r.contribution>=0?"ok":"bad"}` }, [fmtEUR(r.contribution)]),
+            el("td", { class:`right ${r.contributionPct>=0?"ok":"bad"}` }, [`${r.contributionPct.toFixed(1)}%`])
           ]);
         }))
       ])
     ])
   ]);
 
-  return el("div", { class:"grid" }, [card1, card2, table]);
+  const status = el("div", { class:"card col-12" }, [
+    el("div", { class:"title" }, ["Quick Status"]),
+    el("div", { class:"hr" }),
+    el("div", { class:"sub", html: `
+      Inventur-Artikel: <b>${(st.inventory||[]).length}</b> ·
+      Rezepte: <b>${(st.recipes||[]).length}</b> ·
+      Workspace: <b>${escapeHtml(getWorkspace()||"—")}</b>
+    `})
+  ]);
+
+  return el("div", { class:"grid" }, [card1, card2, table, status]);
 }
 
 /* ----------------------- Inventur ----------------------- */
+/* (identisch zu deiner Version – unverändert bis auf migrateParams/saveState im Render Dispatcher) */
 function renderInventory(st){
   const wrap = el("div", { class:"grid" });
 
@@ -522,7 +687,6 @@ function renderInventory(st){
   ]);
   const inv_packPrice = el("input", { class:"input", inputmode:"decimal", placeholder:"z.B. 12,50" });
   const inv_msg = el("div", { class:"small", style:"margin-top:8px" }, [""]);
-
   const btnAddInv = el("button", { class:"btn primary" }, ["Artikel speichern"]);
 
   const inv_tbody = el("tbody", {});
@@ -617,15 +781,7 @@ function renderInventory(st){
     const upView = el("div", { class:"small", style:"margin-top:6px" }, [""]);
 
     function refreshUP(){
-      const tmp = {
-        ...inv,
-        name: name.value,
-        group: group.value,
-        supplier: supplier.value,
-        packSize: packSize.value,
-        packPrice: packPrice.value,
-        unitType: unit.value
-      };
+      const tmp = { ...inv, name: name.value, group: group.value, supplier: supplier.value, packSize: packSize.value, packPrice: packPrice.value, unitType: unit.value };
       upView.innerHTML = `Preis pro Einheit: <b>${unitPrice(tmp).toFixed(4)} €/ ${escapeHtml(tmp.unitType)}</b>`;
     }
     [packSize, packPrice, unit].forEach(x=>x.addEventListener("change", refreshUP));
@@ -707,6 +863,7 @@ function renderInventory(st){
 function renderRecipes(st){
   const wrap = el("div", { class:"grid" });
   const invById = Object.fromEntries((st.inventory||[]).map(x=>[x.id,x]));
+  const p = migrateParams(st.params);
 
   const r_top = el("input", { class:"input", placeholder:"Speisen / Getränke" });
   const r_sub = el("input", { class:"input", placeholder:"z.B. Currywurst / Cocktails" });
@@ -741,7 +898,8 @@ function renderRecipes(st){
             el("th", {}, ["Gericht"]),
             el("th", {}, ["Kategorie"]),
             el("th", { class:"right" }, ["Preis"]),
-            el("th", { class:"right" }, ["Wareneinsatz"])
+            el("th", { class:"right" }, ["WE"]),
+            el("th", { class:"right" }, ["Beitrag"])
           ])
         ]),
         r_tbody
@@ -757,12 +915,13 @@ function renderRecipes(st){
     r_tbody.innerHTML = "";
     const invById2 = Object.fromEntries((st.inventory||[]).map(x=>[x.id,x]));
     (st.recipes||[]).forEach(r=>{
-      const calc = recipeDB(r, st.params||{}, invById2, null);
+      const calc = recipeContribution(r, p, invById2, null);
       const tr = el("tr", { style:"cursor:pointer" }, [
         el("td", { html: escapeHtml(r.name) }),
         el("td", { html: escapeHtml(`${r.topCat||""} / ${r.subCat||""}`) }),
-        el("td", { class:"right" }, [fmtEUR(calc.price)]),
-        el("td", { class:"right" }, [fmtEUR(calc.cost)])
+        el("td", { class:"right" }, [fmtEUR(calc.gross)]),
+        el("td", { class:"right" }, [fmtEUR(calc.cost)]),
+        el("td", { class:`right ${calc.contribution>=0?"ok":"bad"}` }, [fmtEUR(calc.contribution)])
       ]);
       tr.onclick = ()=> openEditor(r.id);
       r_tbody.appendChild(tr);
@@ -794,18 +953,19 @@ function renderRecipes(st){
 
     function drawLines(){
       const invById3 = Object.fromEntries((st.inventory||[]).map(x=>[x.id,x]));
-      const calc = recipeDB(r, st.params||{}, invById3, null);
+      const calc = recipeContribution(r, p, invById3, null);
 
       summary.innerHTML = `
-        Wareneinsatz: <b>${fmtEUR(calc.cost)}</b> ·
-        DB: <b class="${calc.db>=0?"ok":"bad"}">${fmtEUR(calc.db)}</b> ·
-        DB%: <b class="${calc.dbPct>=0?"ok":"bad"}">${calc.dbPct.toFixed(1)}%</b>
+        WE (inkl Waste): <b>${fmtEUR(calc.cost)}</b> ·
+        Fees: <b>${fmtEUR(calc.varFees)}</b> ·
+        Beitrag: <b class="${calc.contribution>=0?"ok":"bad"}">${fmtEUR(calc.contribution)}</b> ·
+        Beitrag%: <b class="${calc.contributionPct>=0?"ok":"bad"}">${calc.contributionPct.toFixed(1)}%</b>
       `;
 
       const tbody = el("tbody", {}, (r.lines||[]).map(l=>{
         const invItem = invById3[l.inventoryId];
         const up = invItem ? unitPrice(invItem) : 0;
-        const cost = invItem ? toNumber(l.qty)*up : 0;
+        const costLine = invItem ? toNumber(l.qty)*up : 0;
 
         const qtyInput = el("input", { class:"input", style:"max-width:140px", inputmode:"decimal", value: String(l.qty ?? "") });
         const btnSaveQty = el("button", { class:"btn", style:"padding:7px 10px" }, ["Speichern"]);
@@ -829,7 +989,7 @@ function renderRecipes(st){
           el("td", { html: escapeHtml(invItem ? invItem.unitType : "") }),
           el("td", { class:"right" }, [qtyInput]),
           el("td", { class:"right" }, [up.toFixed(4)]),
-          el("td", { class:"right" }, [fmtEUR(cost)]),
+          el("td", { class:"right" }, [fmtEUR(costLine)]),
           el("td", { class:"right" }, [el("div",{class:"row",style:"justify-content:flex-end"},[btnSaveQty, btnDel])])
         ]);
       }));
@@ -946,6 +1106,7 @@ function renderRecipes(st){
 function renderSales(st){
   const wrap = el("div", { class:"grid" });
   const invById = Object.fromEntries((st.inventory||[]).map(x=>[x.id,x]));
+  const p = migrateParams(st.params);
   const today = todayISO();
 
   const s_date = el("input", { class:"input", value: today });
@@ -975,7 +1136,8 @@ function renderSales(st){
           el("tr", {}, [
             el("th", {}, ["Gericht"]),
             el("th", { class:"right" }, ["Qty"]),
-            el("th", { class:"right" }, ["DB gesamt"]),
+            el("th", { class:"right" }, ["Umsatz"]),
+            el("th", { class:"right" }, ["Beitrag"]),
             el("th", { class:"right" }, ["Aktion"])
           ])
         ]),
@@ -999,12 +1161,17 @@ function renderSales(st){
     const date = (s_date.value||today).trim();
     const entries = (st.sales||[]).filter(x=>x.date === date);
 
-    let dbSum = 0;
+    let revSum = 0;
+    let contribSum = 0;
+
     entries.forEach(e=>{
       const r = (st.recipes||[]).find(x=>x.id===e.recipeId);
-      const calc = r ? recipeDB(r, st.params||{}, invById, null) : { db:0 };
-      const lineDb = (calc.db || 0) * toNumber(e.qty);
-      dbSum += lineDb;
+      const calc = r ? recipeContribution(r, p, invById, null) : { gross:0, contribution:0 };
+      const q = toNumber(e.qty);
+      const lineRev = (calc.gross || 0) * q;
+      const lineContrib = (calc.contribution || 0) * q;
+      revSum += lineRev;
+      contribSum += lineContrib;
 
       const btnDel = el("button",{class:"btn danger", style:"padding:7px 10px"},["Löschen"]);
       btnDel.onclick = ()=>{
@@ -1015,13 +1182,23 @@ function renderSales(st){
 
       s_tbody.appendChild(el("tr",{},[
         el("td",{html:escapeHtml(r ? r.name : "— (fehlend)")}),
-        el("td",{class:"right"},[String(toNumber(e.qty))]),
-        el("td",{class:`right ${lineDb>=0?"ok":"bad"}`},[fmtEUR(lineDb)]),
+        el("td",{class:"right"},[String(q)]),
+        el("td",{class:"right"},[fmtEUR(lineRev)]),
+        el("td",{class:`right ${lineContrib>=0?"ok":"bad"}`},[fmtEUR(lineContrib)]),
         el("td",{class:"right"},[btnDel])
       ]));
     });
 
-    s_summary.innerHTML = `Tages-DB: <b class="${dbSum>=0?"ok":"bad"}">${fmtEUR(dbSum)}</b>`;
+    const opexM = opexMonthly(p);
+    const cap = capexMonthly(p);
+    const fixedDaily = (opexM + cap.capexMonthlyTotal) / 30;
+
+    s_summary.innerHTML = `
+      Umsatz (gross): <b>${fmtEUR(revSum)}</b><br/>
+      Beitrag (nach WE+Fees): <b class="${contribSum>=0?"ok":"bad"}">${fmtEUR(contribSum)}</b><br/>
+      Fixkosten/Tag (OPEX+CAPEX ÷30): <b>${fmtEUR(fixedDaily)}</b><br/>
+      Ergebnis nach Fixkosten: <b class="${(contribSum-fixedDaily)>=0?"ok":"bad"}">${fmtEUR(contribSum - fixedDaily)}</b>
+    `;
   }
 
   btnAddSale.onclick = ()=>{
@@ -1045,30 +1222,236 @@ function renderSales(st){
   return wrap;
 }
 
-/* ----------------------- Params ----------------------- */
+/* ----------------------- Params (FULL) ----------------------- */
 function renderParams(st){
   const wrap = el("div",{class:"grid"});
-  const p_fr = el("input",{class:"input", inputmode:"decimal", value:String(st.params?.franchisePct ?? 0)});
-  const p_vat = el("input",{class:"input", inputmode:"decimal", value:String(st.params?.vatPct ?? 7)});
-  const p_msg = el("div",{class:"small", style:"margin-top:8px"},[""]);
-  const btnSave = el("button",{class:"btn primary"},["Speichern"]);
+  st.params = migrateParams(st.params);
+  const p = st.params;
 
+  // --- UI inputs helper
+  const mkNum = (value, placeholder="") => el("input",{class:"input", inputmode:"decimal", value:String(value ?? 0), placeholder});
+  const mkBool = (value) => el("select",{class:"input"},[
+    el("option",{value:"true"},["Ja"]),
+    el("option",{value:"false"},["Nein"])
+  ]);
+
+  const priceIncludesVat = mkBool(p.priceIncludesVat ? "true":"false");
+  priceIncludesVat.value = p.priceIncludesVat ? "true":"false";
+
+  const vatPct = mkNum(p.vatPct, "z.B. 7");
+
+  const platformPct = mkNum(p.platformPct, "z.B. 23");
+  const paymentPct  = mkNum(p.paymentPct, "z.B. 1.8");
+  const deliveryPct  = mkNum(p.deliveryPct, "z.B. 18");
+  const deliveryFixed = mkNum(p.deliveryFixed, "z.B. 0.50");
+  const franchisePct = mkNum(p.franchisePct, "z.B. 5");
+  const marketingPct = mkNum(p.marketingPct, "z.B. 2");
+
+  const packagingFixed = mkNum(p.packagingFixed, "z.B. 0.30");
+  const wastePct = mkNum(p.wastePct, "z.B. 2");
+  const refundPct = mkNum(p.refundPct, "z.B. 1");
+
+  const o_rent = mkNum(p.opex.rent);
+  const o_staff = mkNum(p.opex.staff);
+  const o_util = mkNum(p.opex.utilities);
+  const o_net = mkNum(p.opex.internet);
+  const o_ins = mkNum(p.opex.insurance);
+  const o_soft = mkNum(p.opex.software);
+  const o_other = mkNum(p.opex.other);
+
+  const capexTotal = mkNum(p.capexTotal, "z.B. 15000");
+  const capexAmortMonths = mkNum(p.capexAmortMonths, "z.B. 36");
+
+  const financingEnabled = mkBool(p.financingEnabled ? "true":"false");
+  financingEnabled.value = p.financingEnabled ? "true":"false";
+  const equity = mkNum(p.equity, "z.B. 5000");
+  const loanAmount = mkNum(p.loanAmount, "z.B. 10000");
+  const interestPctPA = mkNum(p.interestPctPA, "z.B. 8");
+  const loanMonths = mkNum(p.loanMonths, "z.B. 36");
+
+  const msg = el("div",{class:"small", style:"margin-top:8px"},[""]);
+  const preview = el("div",{class:"sub", style:"margin-top:10px"},[""]);
+
+  function refreshPreview(){
+    const tmp = migrateParams({
+      ...p,
+      priceIncludesVat: priceIncludesVat.value === "true",
+      vatPct: vatPct.value,
+
+      platformPct: platformPct.value,
+      paymentPct: paymentPct.value,
+      deliveryPct: deliveryPct.value,
+      deliveryFixed: deliveryFixed.value,
+      franchisePct: franchisePct.value,
+      marketingPct: marketingPct.value,
+
+      packagingFixed: packagingFixed.value,
+      wastePct: wastePct.value,
+      refundPct: refundPct.value,
+
+      opex: {
+        rent: o_rent.value, staff: o_staff.value, utilities: o_util.value, internet: o_net.value,
+        insurance: o_ins.value, software: o_soft.value, other: o_other.value
+      },
+
+      capexTotal: capexTotal.value,
+      capexAmortMonths: capexAmortMonths.value,
+
+      financingEnabled: financingEnabled.value === "true",
+      equity: equity.value,
+      loanAmount: loanAmount.value,
+      interestPctPA: interestPctPA.value,
+      loanMonths: loanMonths.value
+    });
+
+    const om = opexMonthly(tmp);
+    const cm = capexMonthly(tmp);
+    const fixedM = om + cm.capexMonthlyTotal;
+    const fixedD = fixedM / 30;
+
+    preview.innerHTML = `
+      <b>Vorschau:</b><br/>
+      OPEX/Monat: <b>${fmtEUR(om)}</b><br/>
+      CAPEX/Monat: <b>${fmtEUR(cm.capexMonthlyTotal)}</b>
+      <span class="small">(Abschr. ${fmtEUR(cm.depreciation)} + Kredit ${fmtEUR(cm.loanPayment)})</span><br/>
+      Fixkosten/Monat: <b>${fmtEUR(fixedM)}</b> · Fixkosten/Tag: <b>${fmtEUR(fixedD)}</b>
+    `;
+  }
+
+  [
+    priceIncludesVat, vatPct,
+    platformPct, paymentPct, deliveryPct, deliveryFixed, franchisePct, marketingPct,
+    packagingFixed, wastePct, refundPct,
+    o_rent, o_staff, o_util, o_net, o_ins, o_soft, o_other,
+    capexTotal, capexAmortMonths,
+    financingEnabled, equity, loanAmount, interestPctPA, loanMonths
+  ].forEach(i => i.addEventListener("change", refreshPreview));
+
+  const btnSave = el("button",{class:"btn primary"},["Speichern"]);
   btnSave.onclick = ()=>{
-    st.params = st.params || {};
-    st.params.franchisePct = (p_fr.value||"0").trim();
-    st.params.vatPct = (p_vat.value||"7").trim();
+    st.params = migrateParams({
+      ...st.params,
+      priceIncludesVat: priceIncludesVat.value === "true",
+      vatPct: (vatPct.value||"0").trim(),
+
+      platformPct: (platformPct.value||"0").trim(),
+      paymentPct: (paymentPct.value||"0").trim(),
+      deliveryPct: (deliveryPct.value||"0").trim(),
+      deliveryFixed: (deliveryFixed.value||"0").trim(),
+      franchisePct: (franchisePct.value||"0").trim(),
+      marketingPct: (marketingPct.value||"0").trim(),
+
+      packagingFixed: (packagingFixed.value||"0").trim(),
+      wastePct: (wastePct.value||"0").trim(),
+      refundPct: (refundPct.value||"0").trim(),
+
+      opex: {
+        rent: (o_rent.value||"0").trim(),
+        staff: (o_staff.value||"0").trim(),
+        utilities: (o_util.value||"0").trim(),
+        internet: (o_net.value||"0").trim(),
+        insurance: (o_ins.value||"0").trim(),
+        software: (o_soft.value||"0").trim(),
+        other: (o_other.value||"0").trim()
+      },
+
+      capexTotal: (capexTotal.value||"0").trim(),
+      capexAmortMonths: (capexAmortMonths.value||"36").trim(),
+
+      financingEnabled: financingEnabled.value === "true",
+      equity: (equity.value||"0").trim(),
+      loanAmount: (loanAmount.value||"0").trim(),
+      interestPctPA: (interestPctPA.value||"0").trim(),
+      loanMonths: (loanMonths.value||"36").trim()
+    });
+
     saveState(st);
-    p_msg.innerHTML = `<span class="ok">Gespeichert.</span>`;
+    msg.innerHTML = `<span class="ok">Gespeichert.</span>`;
+    refreshPreview();
   };
 
-  wrap.appendChild(el("div",{class:"card col-12 col-6"},[
-    el("div",{class:"title"},["Parameter"]),
-    el("div",{class:"sub"},["Franchise% wird im Deckungsbeitrag abgezogen (Preis * %)."]),
-    el("div",{class:"label"},["Franchise %"]), p_fr,
-    el("div",{class:"label"},["MwSt % (nur gespeichert, MVP noch ohne Netto/Brutto)"]), p_vat,
-    el("div",{class:"row", style:"margin-top:12px"},[btnSave]),
-    p_msg
-  ]));
+  const blockA = el("div",{class:"card col-12"},[
+    el("div",{class:"title"},["Parameter – Preis/Steuern"]),
+    el("div",{class:"grid"},[
+      el("div",{class:"col-6"},[el("div",{class:"label"},["Preis enthält MwSt?"]), priceIncludesVat]),
+      el("div",{class:"col-6"},[el("div",{class:"label"},["MwSt %"]), vatPct]),
+      el("div",{class:"col-12"},[el("div",{class:"hint"},["Hinweis: DB/Beitrag wird immer auf Basis Menüpreis (gross) gerechnet. MwSt wird aktuell nur als Info/Netto angezeigt."])
+      ])
+    ])
+  ]);
+
+  const blockB = el("div",{class:"card col-12"},[
+    el("div",{class:"title"},["Variable Gebühren (auf Umsatz)"]),
+    el("div",{class:"grid"},[
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Plattform %"]), platformPct]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Payment %"]), paymentPct]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Delivery %"]), deliveryPct]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Delivery fix €/Order"]), deliveryFixed]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Franchise %"]), franchisePct]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Marketing %"]), marketingPct]),
+    ])
+  ]);
+
+  const blockC = el("div",{class:"card col-12"},[
+    el("div",{class:"title"},["Variable Kosten / Risiken"]),
+    el("div",{class:"grid"},[
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Packaging €/Order"]), packagingFixed]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Waste % (auf WE)"]), wastePct]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Refund % (auf Umsatz)"]), refundPct]),
+    ])
+  ]);
+
+  const blockD = el("div",{class:"card col-12"},[
+    el("div",{class:"title"},["Fixkosten (OPEX) pro Monat"]),
+    el("div",{class:"grid"},[
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Miete"]), o_rent]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Personal"]), o_staff]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Strom/Gas/Wasser"]), o_util]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Internet/Telefon"]), o_net]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Versicherung"]), o_ins]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Software"]), o_soft]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Sonstiges"]), o_other]),
+    ])
+  ]);
+
+  const blockE = el("div",{class:"card col-12"},[
+    el("div",{class:"title"},["Investitionskosten (CAPEX)"]),
+    el("div",{class:"grid"},[
+      el("div",{class:"col-6"},[el("div",{class:"label"},["Investition total (€)"]), capexTotal]),
+      el("div",{class:"col-6"},[el("div",{class:"label"},["Abschreibung (Monate)"]), capexAmortMonths]),
+      el("div",{class:"col-12"},[el("div",{class:"hint"},["CAPEX-Monatslast = Investition/Monate (+ optional Kreditrate)"])
+      ])
+    ])
+  ]);
+
+  const blockF = el("div",{class:"card col-12"},[
+    el("div",{class:"title"},["Finanzierung (optional)"]),
+    el("div",{class:"grid"},[
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Finanzierung aktiv?"]), financingEnabled]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Eigenkapital (€)"]), equity]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Kreditbetrag (€)"]), loanAmount]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Zins p.a. %"]), interestPctPA]),
+      el("div",{class:"col-4"},[el("div",{class:"label"},["Laufzeit (Monate)"]), loanMonths]),
+      el("div",{class:"col-12"},[el("div",{class:"hint"},["Wenn Kreditbetrag leer ist, wird er als (CAPEX − Eigenkapital) angenommen."])
+      ])
+    ])
+  ]);
+
+  const actions = el("div",{class:"card col-12"},[
+    el("div",{class:"row"},[btnSave]),
+    msg,
+    preview
+  ]);
+
+  wrap.appendChild(blockA);
+  wrap.appendChild(blockB);
+  wrap.appendChild(blockC);
+  wrap.appendChild(blockD);
+  wrap.appendChild(blockE);
+  wrap.appendChild(blockF);
+  wrap.appendChild(actions);
+
+  refreshPreview();
   return wrap;
 }
 
