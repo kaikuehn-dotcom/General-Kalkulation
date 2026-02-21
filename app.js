@@ -1,44 +1,41 @@
 // Heisse Ecke MVP – GitHub Pages ready (pure HTML/JS)
-// Features:
-// - Responsive (Desktop/Tablet/iPhone Browser)
-// - Dark/Light toggle (saved)
-// - Login via username (Admin can manage users in-app)
-// - Local autosave for inventory/recipes/params/sales/users
-// - Core calculations: unit price, recipe line cost, dish DB and daily DB
+// + Cloud Sync (zwischen Geräten wechseln) via Supabase
+// Konzept:
+// - Lokal wird sofort gespeichert (flüssig).
+// - Zusätzlich wird der komplette App-Stand in "app_state" pro "workspace" gespeichert.
+// - Du brauchst nur einen Workspace-Code (z.B. "heisse-ecke") und teilst den mit Kollegen.
+
+const SUPABASE_URL = "https://opiohltflibtusspvkih.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9waW9obHRmbGlidHVzc3B2a2loIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE2MDQ5NDEsImV4cCI6MjA4NzE4MDk0MX0.UfWr0G-w8j9PN-zb8-KL-OpmZeReypmkmpfPV_5Cwfg";
 
 const LS = {
   theme: "he_theme",
   session: "he_session",
   ui: "he_ui",
-  users: "he_users",               // local users managed by admin
+  users: "he_users",
   inventory: "he_inventory",
   recipes: "he_recipes",
   params: "he_params",
   sales: "he_sales",
   lastSaved: "he_last_saved",
+  workspace: "he_workspace",
+  syncStatus: "he_sync_status",
 };
 
 function $(sel){ return document.querySelector(sel); }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }
 function nowISO(){ return new Date().toISOString(); }
 function fmtTime(ts){
-  try{
-    const d = new Date(ts);
-    return d.toLocaleString();
-  }catch{ return ""; }
+  try{ return new Date(ts).toLocaleString(); }catch{ return ""; }
 }
 
 function readJSON(key, fallback){
-  try{
-    const v = localStorage.getItem(key);
-    return v ? JSON.parse(v) : fallback;
-  }catch{
-    return fallback;
-  }
+  try{ const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }catch{ return fallback; }
 }
 function writeJSON(key, value){
   localStorage.setItem(key, JSON.stringify(value));
   localStorage.setItem(LS.lastSaved, nowISO());
+  scheduleCloudSave(); // << Cloud Sync
 }
 
 function setTheme(theme){
@@ -54,40 +51,25 @@ function getSession(){ return readJSON(LS.session, null); }
 function setSession(session){ writeJSON(LS.session, session); }
 function clearSession(){ localStorage.removeItem(LS.session); }
 
-async function loadUsersFromJson(){
-  const res = await fetch("./data/users.json", { cache: "no-store" });
-  if(!res.ok) return [];
-  const data = await res.json();
-  return data.users || [];
-}
-async function getUsers(){
-  // local overrides json (admin-managed users live in localStorage)
-  const local = readJSON(LS.users, null);
-  if(Array.isArray(local) && local.length) return local;
-  const fromJson = await loadUsersFromJson();
-  return fromJson;
-}
-async function ensureLocalUsersSeeded(){
-  const local = readJSON(LS.users, null);
-  if(Array.isArray(local) && local.length) return;
-  const fromJson = await loadUsersFromJson();
-  if(fromJson.length){
-    writeJSON(LS.users, fromJson);
-  }else{
-    writeJSON(LS.users, [{ username:"admin", displayName:"Admin" }]);
-  }
+function getWorkspace(){ return (localStorage.getItem(LS.workspace) || "").trim(); }
+function setWorkspace(ws){ localStorage.setItem(LS.workspace, ws); }
+
+function setSyncStatus(text){
+  localStorage.setItem(LS.syncStatus, text);
+  const el = $("#syncStatus");
+  if(el) el.textContent = text;
 }
 
 function seedDataIfEmpty(){
-  if(!Array.isArray(readJSON(LS.inventory, null))) writeJSON(LS.inventory, []);
-  if(!Array.isArray(readJSON(LS.recipes, null))) writeJSON(LS.recipes, []);
-  if(!readJSON(LS.params, null)){
-    writeJSON(LS.params, { franchisePct: 0, vatPct: 7, fixedCostsMonthly: 0, variableCostsPct: 0 });
-  }
-  if(!Array.isArray(readJSON(LS.sales, null))) writeJSON(LS.sales, []);
-  if(!readJSON(LS.ui, null)) writeJSON(LS.ui, { tab: "dashboard" });
+  if(!Array.isArray(readJSON(LS.inventory, null))) localStorage.setItem(LS.inventory, "[]");
+  if(!Array.isArray(readJSON(LS.recipes, null))) localStorage.setItem(LS.recipes, "[]");
+  if(!readJSON(LS.params, null)) localStorage.setItem(LS.params, JSON.stringify({ franchisePct: 0, vatPct: 7, fixedCostsMonthly: 0, variableCostsPct: 0 }));
+  if(!Array.isArray(readJSON(LS.sales, null))) localStorage.setItem(LS.sales, "[]");
+  if(!readJSON(LS.ui, null)) localStorage.setItem(LS.ui, JSON.stringify({ tab: "dashboard" }));
+  if(!Array.isArray(readJSON(LS.users, null))) localStorage.setItem(LS.users, JSON.stringify([{ username:"admin", displayName:"Admin" }]));
 }
 
+// -------- Admin check
 function isAdmin(session){
   return session && String(session.username||"").toLowerCase() === "admin";
 }
@@ -99,7 +81,6 @@ function toNumber(x){
   const n = Number(s);
   return Number.isFinite(n) ? n : 0;
 }
-
 function calcUnitPrice(item){
   const packPrice = toNumber(item.packPrice);
   const packSize = toNumber(item.packSize);
@@ -110,9 +91,8 @@ function calcUnitPrice(item){
     return packPrice / denom;
   }
   if(packSize <= 0) return 0;
-  return packPrice / packSize; // €/g or €/ml
+  return packPrice / packSize;
 }
-
 function recipeLineCost(line, inventoryById){
   const inv = inventoryById[line.inventoryId];
   if(!inv) return 0;
@@ -121,8 +101,109 @@ function recipeLineCost(line, inventoryById){
   return qty * unitPrice;
 }
 
+// ---------- Cloud Sync (Supabase REST) ----------
+// Wir speichern den KOMPLETTEN Stand als JSON in einer Zeile pro workspace.
+function buildFullState(){
+  return {
+    users: readJSON(LS.users, []),
+    inventory: readJSON(LS.inventory, []),
+    recipes: readJSON(LS.recipes, []),
+    params: readJSON(LS.params, { franchisePct:0, vatPct:7, fixedCostsMonthly:0, variableCostsPct:0 }),
+    sales: readJSON(LS.sales, []),
+    savedAt: localStorage.getItem(LS.lastSaved) || null,
+  };
+}
+function applyFullState(state){
+  if(!state || typeof state !== "object") return;
+  if(Array.isArray(state.users)) localStorage.setItem(LS.users, JSON.stringify(state.users));
+  if(Array.isArray(state.inventory)) localStorage.setItem(LS.inventory, JSON.stringify(state.inventory));
+  if(Array.isArray(state.recipes)) localStorage.setItem(LS.recipes, JSON.stringify(state.recipes));
+  if(state.params) localStorage.setItem(LS.params, JSON.stringify(state.params));
+  if(Array.isArray(state.sales)) localStorage.setItem(LS.sales, JSON.stringify(state.sales));
+  localStorage.setItem(LS.lastSaved, state.savedAt || nowISO());
+}
+
+async function supabaseUpsertState(workspace, data){
+  const url = `${SUPABASE_URL}/rest/v1/app_state?on_conflict=workspace`;
+  const body = [{ workspace, data, updated_at: nowISO() }];
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "apikey": SUPABASE_ANON_KEY,
+      "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+      "Content-Type": "application/json",
+      "Prefer": "resolution=merge-duplicates,return=minimal",
+    },
+    body: JSON.stringify(body)
+  });
+
+  if(!res.ok){
+    const t = await res.text().catch(()=> "");
+    throw new Error(`Cloud Save fehlgeschlagen: ${res.status} ${t}`);
+  }
+}
+
+async function supabaseFetchState(workspace){
+  const url = `${SUPABASE_URL}/rest/v1/app_state?workspace=eq.${encodeURIComponent(workspace)}&select=workspace,data,updated_at`;
+  const res = await fetch(url, {
+    headers: {
+      "apikey": SUPABASE_ANON_KEY,
+      "Authorization": `Bearer ${SUPABASE_ANON_KEY}`,
+    }
+  });
+  if(!res.ok){
+    const t = await res.text().catch(()=> "");
+    throw new Error(`Cloud Load fehlgeschlagen: ${res.status} ${t}`);
+  }
+  const rows = await res.json();
+  if(!Array.isArray(rows) || rows.length === 0) return null;
+  return rows[0]; // {workspace,data,updated_at}
+}
+
+let cloudSaveTimer = null;
+function scheduleCloudSave(){
+  const ws = getWorkspace();
+  if(!ws) return; // kein Workspace = kein Sync
+
+  if(cloudSaveTimer) clearTimeout(cloudSaveTimer);
+  cloudSaveTimer = setTimeout(async ()=>{
+    try{
+      setSyncStatus("Sync: speichere …");
+      await supabaseUpsertState(ws, buildFullState());
+      setSyncStatus("Sync: aktuell ✅");
+    }catch(e){
+      setSyncStatus("Sync: Fehler ❌");
+      console.error(e);
+    }
+  }, 600); // debounce
+}
+
+async function initialCloudPull(){
+  const ws = getWorkspace();
+  if(!ws) return;
+
+  try{
+    setSyncStatus("Sync: lade …");
+    const row = await supabaseFetchState(ws);
+    if(row && row.data){
+      // Konfliktregel MVP: Cloud gewinnt beim Start
+      applyFullState(row.data);
+      setSyncStatus("Sync: geladen ✅");
+    }else{
+      // Noch nichts in Cloud: ersten Stand hochschieben
+      await supabaseUpsertState(ws, buildFullState());
+      setSyncStatus("Sync: initial gespeichert ✅");
+    }
+  }catch(e){
+    setSyncStatus("Sync: Fehler ❌");
+    console.error(e);
+  }
+}
+
 // ---------- Views ----------
 function loginView(){
+  const ws = getWorkspace();
   return `
   <div class="container">
     <div class="header">
@@ -132,34 +213,39 @@ function loginView(){
 
     <div class="grid">
       <div class="card col-12 col-6">
-        <div class="h1">Login</div>
+        <div class="h1">Workspace (gemeinsam über Geräte)</div>
         <div class="small">
-          Gib deinen <b>Benutzernamen</b> ein. Der Admin kann User in der App verwalten.
-          <br/>Hinweis: Wenn du das erste Mal startest, seedet die App die User aus <code>data/users.json</code>.
+          Das ist dein “gemeinsamer Schlüssel” für alle Geräte.
+          <br/>Beispiel: <b>heisse-ecke</b>
         </div>
+        <div class="label">Workspace Code</div>
+        <input class="input" id="workspace" placeholder="z.B. heisse-ecke" value="${escapeHtml(ws)}" />
+        <div class="row" style="margin-top:12px">
+          <button class="btn primary" id="btnSaveWs">Workspace speichern</button>
+        </div>
+        <div class="small" id="wsMsg" style="margin-top:10px"></div>
 
+        <div class="hr"></div>
+
+        <div class="h1">Login</div>
+        <div class="small">Gib deinen <b>Benutzernamen</b> ein. Admin kann User verwalten.</div>
         <div class="label">Benutzername</div>
         <input class="input" id="username" placeholder="z.B. kai" autocomplete="username" />
-
         <div class="row" style="margin-top:12px">
           <button class="btn primary" id="btnLogin">Weiter</button>
         </div>
-
         <div class="small" id="loginMsg" style="margin-top:10px"></div>
       </div>
 
       <div class="card col-12 col-6">
-        <div class="h1">MVP kann</div>
+        <div class="h1">Was jetzt möglich ist</div>
         <div class="small">
-          <ul>
-            <li>Inventur-Artikel anlegen (Packgröße + Packpreis + Einheit) → €/g/ml/stk</li>
-            <li>Rezepte anlegen (Zutaten aus Inventur wählen)</li>
-            <li>Wareneinsatz + DB je Gericht</li>
-            <li>Parameter (Franchise %, MwSt, Fixkosten …)</li>
-            <li>Daily Sales → Tages-DB</li>
-          </ul>
+          ✅ Laptop eingeben → iPhone sieht dieselben Daten (Sync).<br/>
+          ✅ Dark/Light Mode.<br/>
+          ✅ Rezepte/Inventur/DB Berechnung.
+          <br/><br/>
+          Hinweis: Für MVP ist der Workspace-Code wie ein “Team-Passwort”. Wer ihn hat, sieht die Daten.
         </div>
-        <div class="small">Alles wird automatisch gespeichert (Browser). Letzter Save wird oben angezeigt.</div>
       </div>
     </div>
   </div>`;
@@ -170,6 +256,8 @@ function appShell(session, activeTab){
     show ? `<button class="tab ${activeTab===id?"active":""}" data-tab="${id}">${label}</button>` : "";
 
   const lastSaved = localStorage.getItem(LS.lastSaved);
+  const ws = getWorkspace();
+  const sync = localStorage.getItem(LS.syncStatus) || (ws ? "Sync: bereit" : "Sync: aus (kein Workspace)");
 
   return `
   <div class="container">
@@ -177,13 +265,16 @@ function appShell(session, activeTab){
       <div>
         <h1 class="h1">Heisse Ecke – Kalkulation</h1>
         <div class="badge">
+          Workspace: <b>${escapeHtml(ws || "—")}</b> · <span id="syncStatus">${escapeHtml(sync)}</span>
+          <br/>
           Angemeldet als: <b>${escapeHtml(session.displayName)}</b> (@${escapeHtml(session.username)})
           ${isAdmin(session) ? ` · <span class="ok">Admin</span>` : ""}
-          <br/>Letzte Speicherung: <b>${escapeHtml(lastSaved ? fmtTime(lastSaved) : "—")}</b>
+          <br/>Letzte Speicherung (lokal): <b>${escapeHtml(lastSaved ? fmtTime(lastSaved) : "—")}</b>
         </div>
       </div>
       <div class="row">
         <button class="btn" id="btnTheme">Hell/Dunkel</button>
+        <button class="btn" id="btnSyncNow">Sync jetzt</button>
         <button class="btn danger" id="btnLogout">Logout</button>
       </div>
     </div>
@@ -233,6 +324,19 @@ function render(){
 function bindLogin(){
   $("#btnTheme").onclick = toggleTheme;
 
+  $("#btnSaveWs").onclick = async ()=>{
+    const ws = ($("#workspace").value||"").trim();
+    if(!ws){
+      $("#wsMsg").innerHTML = `<span class="danger">Workspace Code fehlt.</span>`;
+      return;
+    }
+    setWorkspace(ws);
+    $("#wsMsg").innerHTML = `<span class="ok">Workspace gespeichert.</span>`;
+
+    seedDataIfEmpty();
+    await initialCloudPull();
+  };
+
   $("#btnLogin").onclick = async () => {
     const u = ($("#username").value || "").trim();
     const msg = $("#loginMsg");
@@ -240,13 +344,16 @@ function bindLogin(){
 
     if(!u){ msg.innerHTML = `<span class="danger">Bitte Username eingeben.</span>`; return; }
 
-    await ensureLocalUsersSeeded();
-    const users = await getUsers();
+    seedDataIfEmpty();
+    await initialCloudPull();
+
+    const users = readJSON(LS.users, []);
     const hit = users.find(x => (x.username || "").toLowerCase() === u.toLowerCase());
     if(!hit){
-      msg.innerHTML = `<span class="danger">Unbekannter Username.</span> Bitte Admin fragen (User-Tab).`;
+      msg.innerHTML = `<span class="danger">Unbekannter Username.</span> Bitte Admin fragen.`;
       return;
     }
+
     setSession({ username: hit.username, displayName: hit.displayName || hit.username, loginAt: nowISO() });
     render();
   };
@@ -256,10 +363,25 @@ function bindShell(session){
   $("#btnTheme").onclick = toggleTheme;
   $("#btnLogout").onclick = () => { clearSession(); render(); };
 
+  $("#btnSyncNow").onclick = async ()=>{
+    const ws = getWorkspace();
+    if(!ws){ alert("Kein Workspace gesetzt (Login-Seite)."); return; }
+    try{
+      setSyncStatus("Sync: speichere …");
+      await supabaseUpsertState(ws, buildFullState());
+      setSyncStatus("Sync: aktuell ✅");
+      await initialCloudPull();
+      render();
+    }catch(e){
+      setSyncStatus("Sync: Fehler ❌");
+      alert("Sync Fehler. Schau Console (F12).");
+      console.error(e);
+    }
+  };
+
   document.querySelectorAll(".tab").forEach(btn=>{
     btn.onclick = () => {
       const tab = btn.getAttribute("data-tab");
-      // prevent non-admin from opening admin tab via UI
       if(tab === "users" && !isAdmin(session)) return;
       writeJSON(LS.ui, { tab });
       render();
@@ -302,25 +424,23 @@ function renderDashboard(){
           Inventur-Artikel: <b>${inv.length}</b><br/>
           Rezepte: <b>${recipes.length}</b><br/>
           Sales heute (${today}): <b>${todays.length}</b><br/>
-          DB heute (berechnet): <b class="${todaysDB>=0?"ok":"danger"}">${todaysDB.toFixed(2)} €</b>
+          DB heute: <b class="${todaysDB>=0?"ok":"danger"}">${todaysDB.toFixed(2)} €</b>
         </div>
       </div>
 
       <div class="card col-12 col-6">
-        <div class="h1">Quick-Checks</div>
+        <div class="h1">Wichtig</div>
         <div class="hr"></div>
         <div class="small">
-          ✅ Komma ist erlaubt (12,50).<br/>
-          ✅ Alles speichert automatisch im Browser.<br/>
-          ✅ Tablet/iPhone: funktioniert im Browser, Buttons sind touch-friendly.<br/>
-          ⚠️ Wenn du in einem neuen Browser/Inkognito öffnest, sind LocalStorage-Daten nicht da.
+          Wenn du am zweiten Gerät denselben <b>Workspace Code</b> eingibst → siehst du denselben Stand.<br/>
+          Bei “Sync Fehler” stimmt meist Supabase Table/Policy nicht.
         </div>
       </div>
 
       <div class="card col-12">
         <div class="h1">Gerichte Übersicht</div>
         <div class="hr"></div>
-        <div class="table-wrap">
+        <div style="overflow:auto;border-radius:12px;border:1px solid var(--border)">
           <table class="table">
             <thead>
               <tr>
@@ -357,10 +477,7 @@ function renderInventory(){
     <div class="grid">
       <div class="card col-12 col-6">
         <div class="h1">Inventur – Artikel anlegen</div>
-        <div class="small">
-          Einheit bitte als Basis: <b>g</b>, <b>ml</b> oder <b>stk</b>.
-          Packgröße ist z.B. 1000 (g) oder 250 (stk).
-        </div>
+        <div class="small">Einheit: <b>g</b>, <b>ml</b> oder <b>stk</b>. Packgröße: z.B. 1000 (g).</div>
 
         <div class="label">Warengruppe/Kategorie</div>
         <input class="input" id="invCat" placeholder="z.B. Fleisch, Saucen, Verpackung" />
@@ -373,7 +490,7 @@ function renderInventory(){
 
         <div class="row">
           <div style="flex:1;min-width:180px">
-            <div class="label">Packgröße (Number)</div>
+            <div class="label">Packgröße</div>
             <input class="input" id="invPackSize" placeholder="z.B. 1000" inputmode="decimal" />
           </div>
           <div style="flex:1;min-width:180px">
@@ -392,14 +509,13 @@ function renderInventory(){
         <div class="row" style="margin-top:12px">
           <button class="btn primary" id="btnAddInv">Artikel speichern</button>
         </div>
-
         <div class="small" id="invMsg" style="margin-top:8px"></div>
       </div>
 
       <div class="card col-12 col-6">
         <div class="h1">Inventur – Liste</div>
         <div class="hr"></div>
-        <div class="table-wrap">
+        <div style="overflow:auto;border-radius:12px;border:1px solid var(--border)">
           <table class="table">
             <thead>
               <tr>
@@ -423,7 +539,6 @@ function renderInventory(){
             </tbody>
           </table>
         </div>
-        <div class="small" style="margin-top:10px">Bearbeiten kommt als nächstes (MVP-Plus). Aktuell: hinzufügen + rechnen.</div>
       </div>
     </div>
   `;
@@ -463,7 +578,6 @@ function renderRecipes(){
     <div class="grid">
       <div class="card col-12 col-6">
         <div class="h1">Rezepte – Gericht anlegen</div>
-        <div class="small">Du kannst nur Inventur-Artikel verwenden, die existieren.</div>
 
         <div class="label">Top-Kategorie</div>
         <input class="input" id="rTop" placeholder="Speisen / Getränke" />
@@ -487,7 +601,7 @@ function renderRecipes(){
       <div class="card col-12 col-6">
         <div class="h1">Rezepte – Liste</div>
         <div class="hr"></div>
-        <div class="table-wrap">
+        <div style="overflow:auto;border-radius:12px;border:1px solid var(--border)">
           <table class="table">
             <thead>
               <tr><th>Gericht</th><th>Kategorie</th><th class="right">Preis</th><th class="right">Zutaten</th></tr>
@@ -508,8 +622,6 @@ function renderRecipes(){
 
       <div class="card col-12">
         <div class="h1">Zutat zu Rezept hinzufügen</div>
-        <div class="small">Wähle Rezept + Inventur-Artikel, gib Menge ein (in g/ml/stk).</div>
-
         <div class="row">
           <div style="flex:1;min-width:240px">
             <div class="label">Rezept</div>
@@ -528,7 +640,6 @@ function renderRecipes(){
             <input class="input" id="lineQty" placeholder="z.B. 120" inputmode="decimal" />
           </div>
         </div>
-
         <div class="row" style="margin-top:12px">
           <button class="btn primary" id="btnAddLine">Zutat hinzufügen</button>
         </div>
@@ -592,13 +703,10 @@ function renderRecipes(){
       <div class="h1" style="font-size:16px">${escapeHtml(r.name)}</div>
       <div class="small">Wareneinsatz: <b>${cost.toFixed(2)} €</b></div>
       <div class="hr"></div>
-      <div class="table-wrap">
+      <div style="overflow:auto;border-radius:12px;border:1px solid var(--border)">
         <table class="table">
           <thead>
-            <tr>
-              <th>Zutat</th><th>Einheit</th>
-              <th class="right">Menge</th><th class="right">€/Einheit</th><th class="right">Kosten</th>
-            </tr>
+            <tr><th>Zutat</th><th>Einheit</th><th class="right">Menge</th><th class="right">€/Einheit</th><th class="right">Kosten</th></tr>
           </thead>
           <tbody>
             ${(r.lines||[]).map(l=>{
@@ -619,7 +727,6 @@ function renderRecipes(){
       </div>
     `;
   }
-
   $("#selRecipe").onchange = drawLines;
   drawLines();
 }
@@ -633,7 +740,6 @@ function renderParams(){
     <div class="grid">
       <div class="card col-12 col-6">
         <div class="h1">Parameter</div>
-        <div class="small">Franchise % wird im Dashboard vom Umsatz abgezogen.</div>
 
         <div class="label">Franchise %</div>
         <input class="input" id="pFr" value="${escapeHtml(params.franchisePct)}" inputmode="decimal" />
@@ -650,15 +756,7 @@ function renderParams(){
         <div class="row" style="margin-top:12px">
           <button class="btn primary" id="btnSaveParams">Speichern</button>
         </div>
-
         <div class="small" id="pMsg" style="margin-top:8px"></div>
-      </div>
-
-      <div class="card col-12 col-6">
-        <div class="h1">Hinweis</div>
-        <div class="small">
-          Nächster Schritt (wenn du willst): Break-even Preis + Fixkosten-Deckung pro Tag/Monat.
-        </div>
       </div>
     </div>
   `;
@@ -708,16 +806,12 @@ function renderSales(){
       <div class="card col-12 col-6">
         <div class="h1">Einträge (heute)</div>
         <div class="hr"></div>
-        <div class="table-wrap">
+        <div style="overflow:auto;border-radius:12px;border:1px solid var(--border)">
           <table class="table">
             <thead><tr><th>Datum</th><th>Gericht</th><th class="right">Qty</th></tr></thead>
             <tbody>
               ${sales.filter(s=>s.date===today).map(s=>`
-                <tr>
-                  <td>${escapeHtml(s.date)}</td>
-                  <td>${escapeHtml(s.recipeName)}</td>
-                  <td class="right">${toNumber(s.qty).toString()}</td>
-                </tr>
+                <tr><td>${escapeHtml(s.date)}</td><td>${escapeHtml(s.recipeName)}</td><td class="right">${toNumber(s.qty).toString()}</td></tr>
               `).join("")}
             </tbody>
           </table>
@@ -757,9 +851,9 @@ function renderUsers(session){
     <div class="grid">
       <div class="card col-12 col-6">
         <div class="h1">User anlegen</div>
-        <div class="small">User werden lokal gespeichert (Browser). Admin ist Username <b>admin</b>.</div>
+        <div class="small">User gelten für den Workspace und werden synchronisiert.</div>
 
-        <div class="label">Username (einfach, ohne Leerzeichen)</div>
+        <div class="label">Username (ohne Leerzeichen)</div>
         <input class="input" id="uName" placeholder="z.B. max" />
 
         <div class="label">Display Name</div>
@@ -774,7 +868,7 @@ function renderUsers(session){
       <div class="card col-12 col-6">
         <div class="h1">User-Liste</div>
         <div class="hr"></div>
-        <div class="table-wrap">
+        <div style="overflow:auto;border-radius:12px;border:1px solid var(--border)">
           <table class="table">
             <thead><tr><th>Username</th><th>Display</th><th class="right">Aktion</th></tr></thead>
             <tbody>
@@ -792,12 +886,6 @@ function renderUsers(session){
               `).join("")}
             </tbody>
           </table>
-        </div>
-
-        <div class="hr"></div>
-        <div class="small">
-          Tipp: Wenn du die App in einem anderen Browser/Device öffnest, sind Local-Users nicht da.
-          Dann entweder neu anlegen oder später Backend anbinden.
         </div>
       </div>
     </div>
@@ -834,4 +922,5 @@ function renderUsers(session){
 }
 
 // boot
+seedDataIfEmpty();
 render();
